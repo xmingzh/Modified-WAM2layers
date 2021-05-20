@@ -25,7 +25,8 @@ def getW(latnrs,lonnrs,final_time,a,time_low,time_up,
         
         # specific humidity (state at 00.00, 06.00, 12.00, 18.00)
         q = Dataset(datapath[0], mode = 'r').variables['q'][time_index,:,latnrs,lonnrs] #kg/kg
-        
+        # surface presure (state at 00.00, 06.00, 12.00, 18.00)
+        sp= Dataset(datapath[10], mode = 'r').variables['sp'][time_index,latnrs,lonnrs]
         # total column water 
         tcw_ERA = Dataset(datapath[2], mode = 'r').variables['tcw'][time_index,latnrs,lonnrs] #kg/m2
     
@@ -35,8 +36,8 @@ def getW(latnrs,lonnrs,final_time,a,time_low,time_up,
         index_insert=len(time_index)
         # time_index=np.arange(begin_time,(begin_time+count_time))
         # surface pressure (state at 00.00, 06.00, 12.00, 18.00)
-        # sp_first = Dataset(datapath[0], mode = 'r').variables['sp'][begin_time:(begin_time+count_time),latnrs,lonnrs]
-        # sp = np.insert(sp_first,[4],(Dataset(datapath[1], mode = 'r').variables['sp'][0,latnrs,lonnrs]), axis = 0) #Pa
+        sp_first = Dataset(datapath[10], mode = 'r').variables['sp'][time_index,latnrs,lonnrs]
+        sp = np.insert(sp_first,[index_insert],(Dataset(datapath[11], mode = 'r').variables['sp'][0,latnrs,lonnrs]), axis = 0) #Pa
         
         # specific humidity (state at 00.00 06.00 12.00 18.00)
         q_first = Dataset(datapath[0], mode = 'r').variables['q'][time_index,:,latnrs,lonnrs]
@@ -49,10 +50,7 @@ def getW(latnrs,lonnrs,final_time,a,time_low,time_up,
     # make cwv vector
     # The pressure level for the download data
     pressure_level= Dataset(datapath[0], mode = 'r').variables['level'][:]
-    # To select the closest pressure level to 812.83 hPa to divide the column air into the bottom and top layers
-    diff=pressure_level-812.83
-    boundary=np.argmin(np.abs(diff))-1
-
+    # make cwv vector
     q_swap = np.swapaxes(q,0,1)
     cwv_swap = np.zeros((len(pressure_level)-1, len(q), len(latitude), len(longitude))) #kg/m2
     for n in range(len(pressure_level)-1):
@@ -77,14 +75,55 @@ def getW(latnrs,lonnrs,final_time,a,time_low,time_up,
     A_gridcell_1_2D = np.reshape(A_gridcell2D, [1,len(latitude),len(longitude)])
     A_gridcell_plus3D = np.tile(A_gridcell_1_2D,[len(q),1,1])
     
+    # divide the air column into top and bottom layers
+    # The presure to divided the air column into top layer and bottom layer, this equation is same as that (B5) in Van der Ent, R. J., L. Wang-Erlandsson, P. W. Keys, and H. H. G. Savenije, Contrasting roles of interception and
+    #transpiration in the hydrological cycle – Part 2: Moisture recycling, Earth System Dynamics, 5, 471–
+    #489, 2014.
+    p_divd=(7438.803+0.728786*sp)*0.01 #pa change to hpa
+    
+    # Broadcast the p_divd and surface pressure (sp) to the same dimension as cwv
+    p_divd_exp=np.expand_dims(p_divd, axis=1)
+    sp_exp=np.expand_dims(sp, axis=1) 
+    #
+    p_divd_exp=np.broadcast_to(p_divd_exp, cwv.shape)
+    sp_exp=np.broadcast_to(sp_exp, cwv.shape)
+    
+    sp_exp=sp_exp*0.01 #change pa to hpa for surface pressure to consistent with the unit of pressure levels
+    
+    # Considering the n-1 columns for n pressure levels, For the j-th column, its mean pressure 
+    # is defined as the average of top and bottom pressure level. 
+    # Broadcast the mean pressure level to the same dimension as cwv
+    cwv_temp=np.transpose(cwv, (0,2,3,1)) # change the pressure level dimension to the last dimension for broadcast
+    # mean pressure
+    pressure_level_ave=0.5*(pressure_level[:-1]+pressure_level[1:])
+
+    pressure_level_exp=np.broadcast_to(pressure_level_ave,cwv_temp.shape)
+    pressure_level_exp=np.transpose(pressure_level_exp, (0,3,1,2)) # Change it back to the original dimension shape
+    
+    # For a column, its mean pressure <= p_divd is classfied into top layers, and the other is classfied into bottom layer. 
+    # For bottom layer, its mean pressure  <= surface presure is considered as valid data.
+    toplayer_mask=pressure_level_exp<=p_divd_exp
+    bottomlayer_mask=np.logical_and(pressure_level_exp>p_divd_exp,pressure_level_exp<=sp_exp)
+    
+    # Sometimes, there is no valid bottom layer. To solve this problem, the k-th column (the bottommost column) 
+    # in the original top layer was assigned to bottom layer, and the remaining k-1 columns were redefined as the top layer.
+    er_ind=np.sum(bottomlayer_mask,axis=1)
+    er_inds=np.where(er_ind==0)
+    dim1,dim2,dim3=er_inds
+    for a,b,c in zip(dim1,dim2,dim3):
+        temp=toplayer_mask[a,:,b,c]
+        temp_num=np.sum(temp)
+        bottomlayer_mask[a,temp_num-1,b,c]=True
+        toplayer_mask[a,temp_num-1,b,c]=False
+    
     # water volumes
-    vapor_top = np.squeeze(np.sum(cwv[:,0:boundary,:,:],1))
-    vapor_down = np.squeeze(np.sum(cwv[:,boundary:,:,:],1))
+    vapor_top = np.squeeze(np.sum(cwv*toplayer_mask,1))
+    vapor_down = np.squeeze(np.sum(cwv*bottomlayer_mask,1))
     vapor = vapor_top + vapor_down
     W_top = tcw_ERA * (vapor_top / vapor) * A_gridcell_plus3D / density_water #m3
     W_down = tcw_ERA * (vapor_down / vapor) * A_gridcell_plus3D / density_water #m3
     
-    return cw, W_top, W_down
+    return cw, W_top, W_down,toplayer_mask,bottomlayer_mask
 
 #%% Code
 def getwind(latnrs,lonnrs,final_time,a,time_low,time_up):
@@ -119,7 +158,7 @@ def getwind(latnrs,lonnrs,final_time,a,time_low,time_up):
     return U,V
 
 #%% Code
-def getFa(latnrs,lonnrs,cw,U,V,time_low,time_up,a,final_time):
+def getFa(latnrs,lonnrs,cw,U,V,time_low,time_up,a,final_time,toplayer_mask,bottomlayer_mask):
     
     if a != final_time: #not the end of the year
         time=Dataset(datapath[2], mode = 'r').variables['time'][:]
@@ -172,10 +211,10 @@ def getFa(latnrs,lonnrs,cw,U,V,time_low,time_up,a,final_time):
     diff=pressure_level-812.83
     boundary=np.argmin(np.abs(diff))
     # uncorrected down and top fluxes
-    Fa_E_down_uncorr = np.squeeze(np.sum(Fa_E_p[:,boundary:,:,:],1)) #kg*m-1*s-1
-    Fa_N_down_uncorr = np.squeeze(np.sum(Fa_N_p[:,boundary:,:,:],1)) #kg*m-1*s-1
-    Fa_E_top_uncorr = np.squeeze(np.sum(Fa_E_p[:,0:boundary,:,:],1)) #kg*m-1*s-1
-    Fa_N_top_uncorr = np.squeeze(np.sum(Fa_N_p[:,0:boundary,:,:],1)) #kg*m-1*s-1
+    Fa_E_down_uncorr = np.squeeze(np.sum(Fa_E_p*bottomlayer_mask,1)) #kg*m-1*s-1
+    Fa_N_down_uncorr = np.squeeze(np.sum(Fa_N_p*bottomlayer_mask,1)) #kg*m-1*s-1
+    Fa_E_top_uncorr = np.squeeze(np.sum(Fa_E_p*toplayer_mask,1)) #kg*m-1*s-1
+    Fa_N_top_uncorr = np.squeeze(np.sum(Fa_N_p*toplayer_mask,1)) #kg*m-1*s-1
     
     # correct down and top fluxes
     corr_E1=ewf/(Fa_E_down_uncorr+Fa_E_top_uncorr)
@@ -556,9 +595,12 @@ def data_path(yearnumber,a,input_folder):
     v_f_eoy_data = os.path.join(input_folder, str(yearnumber+1) + '-V-level.nc' )
 
     evaporation_data = os.path.join(input_folder, str(yearnumber) + '-E.nc')
-    precipitation_data = os.path.join(input_folder, str(yearnumber) + '-P.nc')    
+    precipitation_data = os.path.join(input_folder, str(yearnumber) + '-P.nc') 
+
+    sp_data=os.path.join(input_folder, str(yearnumber) + '-sp.nc')
+    sp_eoy_data=os.path.join(input_folder, str(yearnumber+1) + '-sp.nc')   
     
-    return q_f_data,q_f_eoy_data,vint_data,vint_eoy_data,u_f_data,u_f_eoy_data,v_f_data,v_f_eoy_data,evaporation_data,precipitation_data
+    return q_f_data,q_f_eoy_data,vint_data,vint_eoy_data,u_f_data,u_f_eoy_data,v_f_data,v_f_eoy_data,evaporation_data,precipitation_data,sp_data,sp_eoy_data
 
 
 #%% Main function for the Fluxes and States
@@ -584,13 +626,13 @@ def FLUX_States_mainfunction(yearnumber,a,time_reduce,latnrs,lonnrs,isglobal,inp
 	time_up=time_low+23
 
     #1 integrate specific humidity to get the (total) column water (vapor)
-	cw,W_top,W_down = getW(latnrs,lonnrs,final_time,a,time_low,time_up,density_water,latitude,longitude,g,A_gridcell)
+	cw,W_top,W_down,toplayer_mask,bottomlayer_mask = getW(latnrs,lonnrs,final_time,a,time_low,time_up,density_water,latitude,longitude,g,A_gridcell)
             
 	#2 wind in between pressure levels
 	U,V = getwind(latnrs,lonnrs,final_time,a,time_low,time_up)
             
 	#3 calculate horizontal moisture fluxes
-	Fa_E_top,Fa_N_top,Fa_E_down,Fa_N_down = getFa(latnrs,lonnrs,cw,U,V,time_low,time_up,a,final_time)
+	Fa_E_top,Fa_N_top,Fa_E_down,Fa_N_down = getFa(latnrs,lonnrs,cw,U,V,time_low,time_up,a,final_time,toplayer_mask,bottomlayer_mask)
             
 	#4 evaporation and precipitation
 	E,P = getEP(latnrs,lonnrs,time_low,time_up,latitude,longitude,A_gridcell)
