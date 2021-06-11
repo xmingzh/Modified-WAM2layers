@@ -1,4 +1,5 @@
 # Modified-WAM2layers
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.4796962.svg)](http://doi.org/10.5281/zenodo.4796962)
  
 The origianl Python code for the WAM-2layers model was retrieved from GitHub (https://github.com/ruudvdent/WAM2layersPython). It was further modified to fit the ERA5 data.
 
